@@ -1,92 +1,9 @@
+#include <memory>
 #include <utility>
 #include <optional>
 #include <type_traits>
 
 namespace prms {
-template <typename T>
-class IntrusiveRef;
-
-template <typename T>
-class IntrusiveRefObserver {
-  friend class IntrusiveRef<T>;
-
- public:
-  IntrusiveRefObserver() : ref_{nullptr} {}
-  explicit IntrusiveRefObserver(IntrusiveRef<T>& ref) : ref_{&ref} {
-    ref_->observer_ = this;
-  }
-  ~IntrusiveRefObserver() {
-    if (ref_ != nullptr) {
-      ref_->observer_ = nullptr;
-    }
-  }
-
-  IntrusiveRefObserver(IntrusiveRefObserver&& other) noexcept
-      : ref_{std::exchange(other.ref_, nullptr)} {
-    if (ref_ != nullptr) {
-      ref_->observer_ = this;
-    }
-  }
-
-  IntrusiveRefObserver& operator=(IntrusiveRefObserver&& other) noexcept {
-    if (this != &other) {
-      ref_ = std::exchange(other.ref_, nullptr);
-      if (ref_ != nullptr) {
-        ref_->observer_ = this;
-      }
-    }
-    return *this;
-  }
-
-  IntrusiveRefObserver(IntrusiveRefObserver const&) = delete;
-  IntrusiveRefObserver& operator=(IntrusiveRefObserver const&) = delete;
-
-  explicit operator bool() const { return ref_ != nullptr; }
-  T* get() { return (ref_ != nullptr) ? ref_->get() : nullptr; }
-  T const* get() const { return (ref_ != nullptr) ? ref_->get() : nullptr; }
-  T* operator->() { return get(); }
-  T const* operator->() const { return get(); }
-
- private:
-  IntrusiveRef<T>* ref_;
-};
-
-template <typename T>
-class IntrusiveRef {
-  friend class IntrusiveRefObserver<T>;
-
- public:
-  ~IntrusiveRef() {
-    if (observer_ != nullptr) {
-      observer_->ref_ = nullptr;
-    }
-  }
-
-  IntrusiveRef() : observer_{nullptr} {}
-
-  IntrusiveRef(IntrusiveRef&& other) noexcept
-      : observer_{std::exchange(other.observer_, nullptr)} {
-    observer_->ref_ = this;
-  }
-
-  IntrusiveRef& operator=(IntrusiveRef&& other) noexcept {
-    if (this != other) {
-      observer_ = std::exchange(other.observer_, nullptr);
-      observer_->ref = this;
-    }
-    return *this;
-  }
-
-  IntrusiveRef(IntrusiveRef const&) = delete;
-  IntrusiveRef& operator=(IntrusiveRef const&) = delete;
-
-  T* get() { return static_cast<T*>(this); }
-  T const* get() const { return static_cast<T const*>(this); }
-
- private:
-  IntrusiveRefObserver<T>* observer_;
-};
-
 template <typename Output>
 class Promise;
 
@@ -121,14 +38,41 @@ using PromiseInvokeResT = typename PromiseInvokeRes<F, T>::type;
 }  // namespace _internal
 
 template <typename Output>
-class IFuture : public IntrusiveRef<IFuture<Output>> {
+class IFuture {
  public:
-  IFuture() = default;
-  IFuture(IFuture&& other) : IntrusiveRef<IFuture<Output>>{std::move(other)} {}
-
   virtual ~IFuture() = default;
 
   virtual void Invoke(Output output) = 0;
+};
+
+template <typename Output>
+class PromiseState {
+ public:
+  PromiseState() = default;
+  PromiseState(PromiseState const&) = delete;
+  PromiseState(PromiseState&&) noexcept = delete;
+
+  void SetValue(Output output) {
+    if (future_ != nullptr) {
+      future_->Invoke(std::move(output));
+      future_ = nullptr;
+      return;
+    }
+    output_ = std::move(output);
+  }
+
+  void SetFuture(IFuture<Output>& future) {
+    if (output_) {
+      future.Invoke(std::move(output_.value()));
+      output_.reset();
+      return;
+    }
+    future_ = &future;
+  }
+
+ private:
+  IFuture<Output>* future_;
+  std::optional<Output> output_;
 };
 
 template <typename Output, typename OutputHandler, typename Child = void,
@@ -145,37 +89,38 @@ class Future<Output, OutputHandler, Child,
   friend class Future;
 
  public:
-  using PromiseType = std::decay_t<std::invoke_result_t<OutputHandler, Output>>;
-  using PromiseOut = _internal::PromiseOutput<PromiseType>;
-
   constexpr Future(Future<Output, OutputHandler>&& h, Child&& child)
       : IFuture<Output>{std::move(h)},
-        promise_{h.promise_},
-        handler_{std::move(h.handler_)},
-        child_{std::move(child)} {}
+        head_{std::move(h)},
+        child_{std::move(child)} {
+    if (head_.state_) {
+      head_.state_->SetFuture(*this);
+    }
+  }
 
   constexpr Future(Future&& other) noexcept
       : IFuture<Output>{std::move(other)},
-        promise_{other.promise_},
-        handler_{std::move(other.handler_)},
-        child_{std::move(other.child_)} {}
+        head_{std::move(other.head_)},
+        child_{std::move(other.child_)} {
+    if (head_.state_) {
+      head_.state_->SetFuture(*this);
+    }
+  }
 
   void Invoke(Output output) override {
-    decltype(auto) promise = handler_(output);
-    promise.SetFuture(&child_);
+    decltype(auto) promise = head_.handler_(std::forward<Output>(output));
+    promise.state_->SetFuture(child_);
   }
 
   template <typename Func>
   [[nodiscard]] constexpr auto Then(Func&& func) && {
     using NewChild = decltype(std::move(child_).Then(std::forward<Func>(func)));
     return Future<Output, OutputHandler, NewChild>{
-        Future<Output, OutputHandler>{promise_, std::move(handler_)},
-        std::move(child_).Then(std::forward<Func>(func))};
+        std::move(head_), std::move(child_).Then(std::forward<Func>(func))};
   }
 
  private:
-  Promise<Output>* promise_;
-  OutputHandler handler_;
+  Future<Output, OutputHandler> head_;
   Child child_;
 };
 
@@ -189,36 +134,47 @@ class Future<Output, OutputHandler, void,
   friend class Future;
 
  public:
-  using PromiseType = std::decay_t<std::invoke_result_t<OutputHandler, Output>>;
+  using PromiseType = std::invoke_result_t<OutputHandler, Output>;
   using PromiseOut = typename _internal::PromiseOutput<PromiseType>::type;
 
-  constexpr Future(Promise<Output>* p, OutputHandler&& h)
-      : promise_{p}, handler_{std::move(h)} {
-    if (promise_) {
-      promise_->SetFuture(this);
+  constexpr Future(std::shared_ptr<PromiseState<Output>> s, OutputHandler h)
+      : state_{s}, handler_{std::move(h)} {
+    if (state_) {
+      state_->SetFuture(*this);
     }
   }
+
+  constexpr explicit Future(OutputHandler&& h) : handler_{std::move(h)} {}
+
   constexpr Future(Future&& other) noexcept
-      : IFuture<Output>{std::move(other)},
-        promise_{other.promise_},
-        handler_{std::move(other.handler_)} {}
+      : state_{other.state_},
+        handler_{std::move(other.handler_)},
+        child_state_{other.child_state_} {
+    if (state_) {
+      state_->SetFuture(*this);
+    }
+  }
 
   void Invoke(Output output) override {
     decltype(auto) p = handler_(std::forward<Output>(output));
-    child_promise_ = &p;
+    child_state_ = p.state_;
   }
 
   template <typename Func>
   [[nodiscard]] constexpr auto Then(Func&& func) && {
     using NewChild = Future<PromiseOut, Func>;
+    if (child_state_) {
+      return Future<Output, OutputHandler, NewChild>{
+          std::move(*this), NewChild{child_state_, std::forward<Func>(func)}};
+    }
     return Future<Output, OutputHandler, NewChild>{
-        std::move(*this), NewChild{child_promise_, std::forward<Func>(func)}};
+        std::move(*this), NewChild{std::forward<Func>(func)}};
   }
 
  private:
-  Promise<Output>* promise_;
-  PromiseType* child_promise_{nullptr};
+  std::shared_ptr<PromiseState<Output>> state_{};
   OutputHandler handler_;
+  std::shared_ptr<PromiseState<PromiseOut>> child_state_{};
 };
 
 //////////////
@@ -231,54 +187,43 @@ class Future<Output, OutputHandler, void,
   friend class Future;
 
  public:
-  constexpr Future(Promise<Output>* p, OutputHandler&& h)
-      : promise_{p}, handler_{std::move(h)} {
-    if (promise_) {
-      promise_->SetFuture(this);
+  constexpr Future(std::shared_ptr<PromiseState<Output>> s, OutputHandler&& h)
+      : state_{s}, handler_{std::move(h)} {
+    state_->SetFuture(*this);
+  }
+
+  constexpr explicit Future(OutputHandler&& h) : handler_{std::move(h)} {}
+
+  constexpr Future(Future&& other) noexcept
+      : state_{other.state_}, handler_{std::move(other.handler_)} {
+    if (state_) {
+      state_->SetFuture(*this);
     }
   }
-  constexpr Future(Future&& other) noexcept
-      : IFuture<Output>{std::move(other)},
-        promise_{other.promise_},
-        handler_{std::move(other.handler_)} {}
 
-  void Invoke(Output output) override {
-    handler_(std::forward<Output>(output));
-  }
+  void Invoke(Output output) override { handler_(std::move(output)); }
 
  private:
-  Promise<Output>* promise_;
+  std::shared_ptr<PromiseState<Output>> state_{};
   OutputHandler handler_;
 };
 
 template <typename Output>
 class Promise {
  public:
-  Promise() = default;
+  Promise() : state_{std::make_shared<PromiseState<Output>>()} {}
+  explicit Promise(Output value)
+      : state_{std::make_shared<PromiseState<Output>>()} {
+    state_->SetValue(std::move(value));
+  }
 
   template <typename Func>
   [[nodiscard]] auto Then(Func&& func) {
-    return Future<Output, std::decay_t<Func>>{this, std::forward<Func>(func)};
+    return Future<Output, std::decay_t<Func>>{state_, std::forward<Func>(func)};
   }
 
-  void Resolve(Output output) {
-    if (future_) {
-      future_->Invoke(std::forward<Output>(output));
-      return;
-    }
-    output_ = std::forward<Output>(output);
-  }
+  void Resolve(Output output) { state_->SetValue(std::move(output)); }
 
-  void SetFuture(IFuture<Output>* future) {
-    if (output_) {
-      future->Invoke(*output_);
-      return;
-    }
-    future_ = IntrusiveRefObserver<IFuture<Output>>{*future};
-  }
-
- private:
-  IntrusiveRefObserver<IFuture<Output>> future_;
-  std::optional<Output> output_;
+  std::shared_ptr<PromiseState<Output>> state_;
 };
 }  // namespace prms
